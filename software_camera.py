@@ -14,37 +14,40 @@ MODEL
     The requirement is such a rectangle too. The answer is True exactly when the
     UNION of the camera rectangles contains the WHOLE required rectangle.
 
-    Decisions (documented because the statement leaves them open):
+    Decisions (the statement leaves them open, so they are explicit):
       * Ranges are CLOSED and CONTINUOUS. Distance 5 belongs to both [0, 5] and
         [5, 10], so those two cameras together cover [0, 10]. But [0, 5] and
         [5.0001, 10] leave a gap, which is a failure.
       * Two cameras that only touch at a corner do not cover the areas around
         that corner (a diagonal touch is not a cover).
       * A range with min == max is legal (a single value).
-      * min > max, NaN, non-numbers, or malformed cameras raise an error rather
+      * min > max, NaN, non-numbers or malformed cameras raise an error rather
         than silently returning a wrong answer. +/- infinity is allowed
         (e.g. "works for any light level above 100").
       * Comparisons are exact. Use ints or fractions.Fraction if you need exact
         decimal boundaries (floats such as 0.1 + 0.2 != 0.3 behave as floats do).
 
-ALGORITHM  (coordinate compression + sweep over the distance axis)
-    1. Discard cameras that do not touch the required rectangle.
-    2. Collect all distinct distance boundaries inside the required distance
-       range. They split the distance axis into "elementary pieces": each
-       boundary point itself, and each open gap between neighbouring points.
-       Inside one piece the set of cameras covering it never changes, so
-       checking one representative per piece is exact (no sampling, no epsilon).
-    3. For every piece, take the cameras that span it and check with a greedy
-       interval merge that their light ranges cover the required light range.
-    4. The answer is True iff every piece passes.
+ALGORITHM  (rectangle-union coverage: coordinate compression + sweep line +
+            segment tree)   Time O(n log n), space O(n)
+    1. Validate input; discard cameras that do not touch the required rectangle.
+    2. Coordinate compression with "doubling". On each axis take the distinct
+       camera boundaries inside the required range (plus the range ends) and
+       give every boundary an EVEN index 2k. The open gap between boundary k
+       and k+1 gets the ODD index 2k+1. Every elementary piece of the axis (a
+       single point or an open gap) is now one integer cell, and a closed range
+       [a, b] is exactly the cell range 2*idx(a) .. 2*idx(b). Inside one cell
+       the set of covering cameras never changes, so checking cells is exact
+       (no sampling, no epsilon, no special cases for touching edges).
+    3. Sweep over the distance cells. A camera adds +1 on its light-cell range
+       when the sweep reaches its first distance cell and -1 just after its
+       last one. A segment tree (range add, global minimum, lazy-free) keeps the
+       minimum coverage over all light cells.
+    4. After each batch of events the coverage is constant until the next batch,
+       so it is enough to check that the minimum is > 0 there. The first batch
+       must start at the first distance cell. Any check that fails means an
+       uncovered cell exists -> False. If all pass -> True.
 
-    Time  O(n^2)  (up to 2n+1 pieces x O(n) work each, because cameras are
-                   sorted by light_min once, so the per-piece merge needs no sort)
-    Space O(n)
-
-    (A sweep line with a segment tree gives O(n log n); the O(n^2) version was
-    chosen for clarity and provable correctness. It handles thousands of
-    cameras in well under a second or two; see the performance test.)
+    Sorting/compression O(n log n); 2n range updates at O(log n) each.
 
 USAGE
     from software_camera import Camera, can_build_software_camera
@@ -62,6 +65,7 @@ from __future__ import annotations
 
 import math
 import numbers
+from bisect import bisect_left
 from typing import Iterable, List, NamedTuple, Sequence, Tuple
 
 
@@ -93,27 +97,59 @@ def _unpack_range(name: str, rng: Sequence[float]) -> Tuple[float, float]:
     return lo, hi
 
 
-def _light_range_covered(cams: List[Camera], light_lo: float, light_hi: float) -> bool:
+def _compress(lo: float, hi: float, values: Iterable[float]) -> List[float]:
+    """Sorted distinct coordinates: lo, hi and every value strictly inside."""
+    coords = {lo, hi}
+    coords.update(v for v in values if lo < v < hi)
+    return sorted(coords)
+
+
+class _MinCoverTree:
     """
-    True if the closed light ranges of `cams` (sorted by light_min) cover
-    [light_lo, light_hi]. Greedy merge; touching closed intervals join up.
-    Precondition (guaranteed by the caller): every camera in `cams` reaches
-    light_lo or beyond (light_max >= light_lo) and starts at or below light_hi.
+    Range-add / global-minimum segment tree over `size` cells (bottom-up, no
+    lazy propagation). tree[p] = min over its children + pending[p], so the
+    global minimum is simply tree[1].
+    Cells beyond `size` (power-of-two padding) hold +inf and are never touched.
     """
-    reach = None  # everything in [light_lo, reach] is known to be covered
-    for cam in cams:
-        if reach is None:
-            if cam.light_min > light_lo:
-                return False  # nothing covers light_lo itself
-            reach = cam.light_max
-        else:
-            if cam.light_min > reach:
-                return False  # gap between `reach` and this camera
-            if cam.light_max > reach:
-                reach = cam.light_max
-        if reach >= light_hi:
-            return True
-    return False
+
+    def __init__(self, size: int) -> None:
+        n = 1
+        while n < size:
+            n *= 2
+        self._n = n
+        self._tree = [0] * n + [0] * size + [math.inf] * (n - size)
+        # Internal nodes must start as the min of their children.
+        for p in range(n - 1, 0, -1):
+            self._tree[p] = min(self._tree[2 * p], self._tree[2 * p + 1])
+        self._pending = [0] * n
+
+    def add(self, left: int, right: int, delta: int) -> None:
+        """Add `delta` to every cell in the inclusive range [left, right]."""
+        n, tree, pending = self._n, self._tree, self._pending
+        l, r = left + n, right + n + 1
+        l0, r0 = l, r
+        while l < r:
+            if l & 1:
+                tree[l] += delta
+                if l < n:
+                    pending[l] += delta
+                l += 1
+            if r & 1:
+                r -= 1
+                tree[r] += delta
+                if r < n:
+                    pending[r] += delta
+            l >>= 1
+            r >>= 1
+        for p in (l0, r0 - 1):
+            p >>= 1
+            while p:
+                a, b = tree[2 * p], tree[2 * p + 1]
+                tree[p] = (a if a < b else b) + pending[p]
+                p >>= 1
+
+    def minimum(self) -> float:
+        return self._tree[1]
 
 
 def can_build_software_camera(
@@ -128,6 +164,7 @@ def can_build_software_camera(
 
     Each camera is a Camera or a (dist_min, dist_max, light_min, light_max)
     sequence. Raises TypeError/ValueError on malformed input.
+    Runs in O(n log n) time and O(n) space for n cameras.
     """
     dist_lo, dist_hi = _unpack_range("required_distance", required_distance)
     light_lo, light_hi = _unpack_range("required_light", required_light)
@@ -156,28 +193,47 @@ def can_build_software_camera(
     if not relevant:
         return False  # the required area is never empty (min <= max)
 
-    # Sorted once; filtering below preserves this order.
-    relevant.sort(key=lambda c: c.light_min)
+    # Coordinate compression with doubling: boundary k -> cell 2k, gap -> 2k+1.
+    d_coords = _compress(
+        dist_lo, dist_hi, (v for c in relevant for v in (c.dist_min, c.dist_max))
+    )
+    l_coords = _compress(
+        light_lo, light_hi, (v for c in relevant for v in (c.light_min, c.light_max))
+    )
+    last_d_cell = 2 * (len(d_coords) - 1)
+    light_cells = 2 * len(l_coords) - 1
 
-    # Distinct distance boundaries inside the required range.
-    breaks = {dist_lo, dist_hi}
+    def cell_range(lo: float, hi: float, coords: List[float]) -> Tuple[int, int]:
+        # Clamp to the required range; an outside bound covers from/to the end.
+        first = 0 if lo <= coords[0] else 2 * bisect_left(coords, lo)
+        last = 2 * (len(coords) - 1) if hi >= coords[-1] else 2 * bisect_left(coords, hi)
+        return first, last
+
+    # Events: (distance cell, light first, light last, +1 / -1).
+    events: List[Tuple[int, int, int, int]] = []
     for cam in relevant:
-        for value in (cam.dist_min, cam.dist_max):
-            if dist_lo < value < dist_hi:
-                breaks.add(value)
-    points = sorted(breaks)
+        d_first, d_last = cell_range(cam.dist_min, cam.dist_max, d_coords)
+        l_first, l_last = cell_range(cam.light_min, cam.light_max, l_coords)
+        events.append((d_first, l_first, l_last, 1))
+        if d_last < last_d_cell:  # removal beyond the last cell is irrelevant
+            events.append((d_last + 1, l_first, l_last, -1))
+    events.sort()
 
-    for i, x in enumerate(points):
-        # Piece 1: the single distance x.
-        at_x = [c for c in relevant if c.dist_min <= x <= c.dist_max]
-        if not _light_range_covered(at_x, light_lo, light_hi):
+    # The very first distance cell must be reached by some camera.
+    if events[0][0] != 0:
+        return False
+
+    tree = _MinCoverTree(light_cells)
+    i, total = 0, len(events)
+    while i < total:
+        cell = events[i][0]
+        while i < total and events[i][0] == cell:
+            _, l_first, l_last, delta = events[i]
+            tree.add(l_first, l_last, delta)
+            i += 1
+        # Coverage is constant from `cell` until the next batch (or the end).
+        if tree.minimum() <= 0:
             return False
-        # Piece 2: the open gap between x and the next boundary.
-        if i + 1 < len(points):
-            nxt = points[i + 1]
-            in_gap = [c for c in relevant if c.dist_min <= x and nxt <= c.dist_max]
-            if not _light_range_covered(in_gap, light_lo, light_hi):
-                return False
     return True
 
 
@@ -357,6 +413,17 @@ if __name__ == "__main__":
             with self.assertRaises(ValueError):
                 ok((0, 10), (0, 10), [(0, 10, 0, 10), (50, 40, 0, 1)])
 
+        def test_slightly_inverted_ranges_are_rejected(self):
+            for args in [
+                ((10, 9), (0, 10), [(0, 10, 0, 10)]),
+                ((0, 10), (10, 9.999), [(0, 10, 0, 10)]),
+                ((0, 10), (0, 10), [(10, 9.5, 0, 10)]),
+                ((0, 10), (0, 10), [(0, 10, 3, 2.5)]),
+                ((Fraction(1, 3), Fraction(1, 4)), (0, 1), []),
+            ]:
+                with self.assertRaises(ValueError):
+                    ok(*args)
+
         def test_nan(self):
             nan = float("nan")
             with self.assertRaises(ValueError):
@@ -493,5 +560,181 @@ if __name__ == "__main__":
             params = list(inspect.signature(can_build_software_camera).parameters)
             self.assertEqual(params, ["required_distance", "required_light", "cameras"])
             self.assertIsInstance(ok((0, 1), (0, 1), [(0, 1, 0, 1)]), bool)
+
+    def _reference_quadratic(req_d, req_l, cams):
+        """Previous O(n^2) algorithm, kept ONLY as an independent cross-check."""
+        d_lo, d_hi = req_d
+        l_lo, l_hi = req_l
+        rel = [
+            Camera(*c) for c in cams
+            if c[1] >= d_lo and c[0] <= d_hi and c[3] >= l_lo and c[2] <= l_hi
+        ]
+        if not rel:
+            return False
+        rel.sort(key=lambda c: c.light_min)
+
+        def light_ok(sel):
+            reach = None
+            for c in sel:
+                if reach is None:
+                    if c.light_min > l_lo:
+                        return False
+                    reach = c.light_max
+                else:
+                    if c.light_min > reach:
+                        return False
+                    reach = max(reach, c.light_max)
+                if reach >= l_hi:
+                    return True
+            return False
+
+        pts = sorted({d_lo, d_hi} | {v for c in rel for v in (c.dist_min, c.dist_max) if d_lo < v < d_hi})
+        for i, x in enumerate(pts):
+            if not light_ok([c for c in rel if c.dist_min <= x <= c.dist_max]):
+                return False
+            if i + 1 < len(pts):
+                nx = pts[i + 1]
+                if not light_ok([c for c in rel if c.dist_min <= x and nx <= c.dist_max]):
+                    return False
+        return True
+
+    class SegmentTree(unittest.TestCase):
+        def test_matches_naive_array(self):
+            rng = random.Random(3)
+            for size in list(range(1, 40)) + [63, 64, 65, 200]:
+                tree = _MinCoverTree(size)
+                naive = [0] * size
+                for _ in range(120):
+                    a, b = sorted((rng.randrange(size), rng.randrange(size)))
+                    delta = rng.choice([-2, -1, 1, 1, 2])
+                    tree.add(a, b, delta)
+                    for k in range(a, b + 1):
+                        naive[k] += delta
+                    self.assertEqual(tree.minimum(), min(naive), (size, a, b))
+
+        def test_padding_never_counts_as_a_cell(self):
+            tree = _MinCoverTree(5)  # padded to 8 with +inf
+            tree.add(0, 4, 1)
+            self.assertEqual(tree.minimum(), 1)
+
+    class OptimizedCrossChecks(unittest.TestCase):
+        def test_matches_reference_on_bigger_random_cases(self):
+            rng = random.Random(424242)
+            seen = {True: 0, False: 0}
+            for _ in range(4000):
+                size = rng.choice([4, 8, 20])
+                pair = lambda: tuple(sorted((rng.randint(0, size), rng.randint(0, size))))
+                req_d, req_l = pair(), pair()
+                cams = [pair() + pair() for _ in range(rng.randint(0, 25))]
+                got = ok(req_d, req_l, cams)
+                self.assertEqual(got, _reference_quadratic(req_d, req_l, cams), (req_d, req_l, cams))
+                seen[got] += 1
+            self.assertGreater(seen[True], 200)
+            self.assertGreater(seen[False], 200)
+
+        def test_matches_reference_with_fractions_floats_and_infinity(self):
+            rng = random.Random(11)
+            pool = [-INF, -3, Fraction(-5, 2), 0, 0.5, Fraction(1, 3), 1, 2.25, 7, INF]
+            pool.sort()
+            for _ in range(3000):
+                def pair():
+                    a, b = sorted((rng.choice(pool), rng.choice(pool)))
+                    return a, b
+                req_d, req_l = pair(), pair()
+                cams = [pair() + pair() for _ in range(rng.randint(0, 12))]
+                self.assertEqual(
+                    ok(req_d, req_l, cams), _reference_quadratic(req_d, req_l, cams),
+                    (req_d, req_l, cams),
+                )
+
+        def test_random_tilings_are_covered_and_break_when_a_tile_is_removed(self):
+            rng = random.Random(5)
+            for _ in range(300):
+                xs = sorted(rng.sample(range(1, 60), rng.randint(1, 6)))
+                ys = sorted(rng.sample(range(1, 60), rng.randint(1, 6)))
+                xs, ys = [0] + xs + [60], [0] + ys + [60]
+                tiles = [(xs[i], xs[i + 1], ys[j], ys[j + 1])
+                         for i in range(len(xs) - 1) for j in range(len(ys) - 1)]
+                rng.shuffle(tiles)
+                self.assertTrue(ok((0, 60), (0, 60), tiles))
+                self.assertFalse(ok((0, 60), (0, 60), tiles[1:]))
+
+        def test_events_at_the_same_distance_are_applied_before_checking(self):
+            # One camera ends exactly where another (covering the same light) starts,
+            # plus a third overlapping both: transient states must not fail.
+            cams = [(0, 5, 0, 10), (5, 10, 0, 10), (4, 6, 0, 10)]
+            self.assertTrue(ok((0, 10), (0, 10), cams))
+
+        def test_gap_only_at_the_far_end_and_only_at_the_near_end(self):
+            self.assertFalse(ok((0, 10), (0, 10), [(0, 9, 0, 10)]))
+            self.assertFalse(ok((0, 10), (0, 10), [(1, 10, 0, 10)]))
+            self.assertFalse(ok((0, 10), (0, 10), [(0, 10, 0, 9)]))
+            self.assertFalse(ok((0, 10), (0, 10), [(0, 10, 1, 10)]))
+
+        def test_cameras_extending_far_beyond_the_requirement(self):
+            cams = [(-INF, 5, -INF, INF), (5, INF, -INF, INF)]
+            self.assertTrue(ok((0, 10), (0, 10), cams))
+            self.assertFalse(ok((0, 10), (0, 10), [(-INF, 4.9, -INF, INF), (5, INF, -INF, INF)]))
+
+    class Scalability(unittest.TestCase):
+        def test_200k_chained_cameras(self):
+            n = 200_000
+            cams = [(i, i + 2, 0, 10) for i in range(n)]
+            start = time.perf_counter()
+            self.assertTrue(ok((0, n + 1), (0, 10), cams))
+            elapsed = time.perf_counter() - start
+            cams = [c for c in cams if not (n // 2 - 1 <= c[0] <= n // 2 + 1)]
+            self.assertFalse(ok((0, n + 1), (0, 10), cams))
+            self.assertLess(elapsed, 20)
+
+        def test_300x300_tile_grid_90k_cameras(self):
+            k = 300
+            tiles = [(i, i + 1, j, j + 1) for i in range(k) for j in range(k)]
+            start = time.perf_counter()
+            self.assertTrue(ok((0, k), (0, k), tiles))
+            elapsed = time.perf_counter() - start
+            tiles.remove((123, 124, 45, 46))
+            self.assertFalse(ok((0, k), (0, k), tiles))
+            self.assertLess(elapsed, 30)
+
+        def test_growth_is_near_linearithmic_not_quadratic(self):
+            def run(n):
+                cams = [(i, i + 2, 0, 10) for i in range(n)]
+                t = time.perf_counter()
+                self.assertTrue(ok((0, n + 1), (0, 10), cams))
+                return time.perf_counter() - t
+
+            run(2000)  # warm-up
+            small, big = run(10_000), run(40_000)  # 4x the input
+            # Quadratic would be ~16x; allow generous noise, still far below it.
+            self.assertLess(big / small, 9)
+
+        def test_much_faster_than_the_quadratic_reference(self):
+            n = 3000
+            cams = [(i, i + 2, 0, 10) for i in range(n)]
+            t = time.perf_counter()
+            fast = ok((0, n + 1), (0, 10), cams)
+            t_fast = time.perf_counter() - t
+            t = time.perf_counter()
+            slow = _reference_quadratic((0, n + 1), (0, 10), cams)
+            t_slow = time.perf_counter() - t
+            self.assertEqual(fast, slow)
+            self.assertLess(t_fast * 5, t_slow)
+
+    class ApiContract(unittest.TestCase):
+        def test_returns_plain_bool_and_does_not_mutate_arguments(self):
+            cams = [[5, 10, 0, 10], [0, 5, 0, 10]]
+            rd, rl = [0, 10], [0, 10]
+            snap = ([list(c) for c in cams], list(rd), list(rl))
+            self.assertIs(ok(rd, rl, cams), True)
+            self.assertIs(ok(rd, rl, cams[:1]), False)
+            self.assertEqual(([list(c) for c in cams], rd, rl), snap)
+
+        def test_deterministic(self):
+            rng = random.Random(1)
+            cams = [tuple(sorted((rng.randint(0, 9), rng.randint(0, 9)))) +
+                    tuple(sorted((rng.randint(0, 9), rng.randint(0, 9)))) for _ in range(30)]
+            results = {ok((0, 9), (0, 9), rng.sample(cams, len(cams))) for _ in range(50)}
+            self.assertEqual(len(results), 1)
 
     unittest.main(verbosity=2)
